@@ -1,0 +1,10 @@
+{
+    "smtp_server": "smtp.gmail.com",
+    "smtp_port": 587,
+    "sender_email": "legofferwanvariant616@gmail.com",
+    "sender_password": "CENSORED",
+    "sender_name": "Erwan Le Goff",
+    "delay_between_emails": 3,
+    "smtp_use_tls": true,
+    "timeout": 30
+}

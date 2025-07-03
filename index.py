@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Script d'automatisation d'envoi d'emails
-Permet d'envoyer des emails automatiquement avec personnalisation
+Permet d'envoyer des emails automatiquement avec personnalisation et planification
 """
 
 import smtplib
@@ -14,9 +14,12 @@ from email import encoders
 import csv
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import logging
+import schedule
+import threading
+from pathlib import Path
 
 # Configuration du logging
 logging.basicConfig(
@@ -38,6 +41,9 @@ class EmailAutomation:
         """
         self.config = self.load_config(config_file)
         self.smtp_server = None
+        self.scheduler_running = False
+        self.sent_tracker_file = 'sent_emails_tracker.json'
+        self.sent_emails = self.load_sent_tracker()
         
     def load_config(self, config_file):
         """Charge la configuration depuis un fichier JSON"""
@@ -52,12 +58,49 @@ class EmailAutomation:
                 "sender_email": "legofferwanvariant616@gmail.com",
                 "sender_password": "CENSORED",
                 "sender_name": "Erwan Le Goff",
-                "delay_between_emails": 2
+                "delay_between_emails": 2,
+                "max_emails_per_batch": 10,
+                "schedule_enabled": False,
+                "schedule_interval_hours": 12
             }
             with open(config_file, 'w', encoding='utf-8') as f:
                 json.dump(default_config, f, indent=4, ensure_ascii=False)
             logging.info(f"Fichier de configuration créé : {config_file}")
             return default_config
+    
+    def load_sent_tracker(self):
+        """Charge le tracker des emails envoyés"""
+        try:
+            with open(self.sent_tracker_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+    
+    def save_sent_tracker(self):
+        """Sauvegarde le tracker des emails envoyés"""
+        try:
+            with open(self.sent_tracker_file, 'w', encoding='utf-8') as f:
+                json.dump(self.sent_emails, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            logging.error(f"Erreur lors de la sauvegarde du tracker : {e}")
+    
+    def mark_email_as_sent(self, email, timestamp=None):
+        """Marque un email comme envoyé"""
+        if timestamp is None:
+            timestamp = datetime.now().isoformat()
+        self.sent_emails[email] = timestamp
+        self.save_sent_tracker()
+    
+    def is_email_sent_recently(self, email, hours=24):
+        """Vérifie si un email a été envoyé récemment"""
+        if email not in self.sent_emails:
+            return False
+        
+        try:
+            sent_time = datetime.fromisoformat(self.sent_emails[email])
+            return (datetime.now() - sent_time).total_seconds() < hours * 3600
+        except:
+            return False
     
     def connect_smtp(self):
         """Établit la connexion SMTP"""
@@ -259,7 +302,7 @@ class EmailAutomation:
 
 Je me permets de vous adresser ma candidature spontanée pour une alternance en développement web Full Stack, à partir de septembre 2025, au sein de {company}.
 
-Actuellement en formation Bac+3 Développeur Full Stack chez Cloud Campus, je suis passionné par la création d'applications web modernes, performantes et accessibles. J'ai déjà eu l'opportunité de développer des projets concrets lors de mon stage chez DonkeyCode et à travers mes projets personnels disponibles sur mon portfolio.
+Actuellement en inscrit en formation Bac+3 Développeur Full Stack chez Cloud Campus, je suis passionné par la création d'applications web modernes, performantes et accessibles. J'ai déjà eu l'opportunité de développer des projets concrets lors de mon stage chez DonkeyCode et à travers mes projets personnels disponibles sur mon portfolio.
 
 Mes compétences :
 • Front-end : HTML, CSS, JavaScript, Angular, Bootstrap
@@ -327,7 +370,7 @@ Erwan Le Goff
             attachments=[cv_path]
         )
     
-    def send_bulk_cv_applications(self, recipients_file, cv_path, cover_letter_template=None):
+    def send_bulk_cv_applications(self, recipients_file, cv_path, cover_letter_template=None, check_duplicates=True):
         """
         Envoie des candidatures en masse avec CV
         
@@ -335,15 +378,17 @@ Erwan Le Goff
             recipients_file (str): Fichier CSV avec les destinataires
             cv_path (str): Chemin vers le fichier PDF du CV
             cover_letter_template (str, optional): Template de lettre de motivation
+            check_duplicates (bool): Vérifier les doublons avant envoi
         
         Returns:
             dict: Statistiques d'envoi
         """
         if not os.path.exists(cv_path):
             logging.error(f"Fichier CV introuvable : {cv_path}")
-            return {"sent": 0, "failed": 0, "total": 0, "error": "CV file not found"}
+            return {"sent": 0, "failed": 0, "total": 0, "skipped": 0, "error": "CV file not found"}
         
-        stats = {"sent": 0, "failed": 0, "total": 0}
+        stats = {"sent": 0, "failed": 0, "total": 0, "skipped": 0}
+        max_emails = self.config.get('max_emails_per_batch', 10)
         
         try:
             with open(recipients_file, 'r', encoding='utf-8') as file:
@@ -358,6 +403,17 @@ Erwan Le Goff
                     company = row.get('entreprise', 'votre entreprise')
                     position = row.get('poste', 'le poste proposé')
                     
+                    # Vérification des doublons
+                    if check_duplicates and self.is_email_sent_recently(recipient_email):
+                        logging.info(f"Email déjà envoyé récemment à {recipient_email}, ignoré")
+                        stats["skipped"] += 1
+                        continue
+                    
+                    # Limite du nombre d'emails par lot
+                    if stats["sent"] >= max_emails:
+                        logging.info(f"Limite de {max_emails} emails atteinte pour ce lot")
+                        break
+                    
                     # Personnalisation de la lettre de motivation si template fourni
                     if cover_letter_template:
                         cover_letter = self.personalize_message(cover_letter_template, row)
@@ -367,6 +423,7 @@ Erwan Le Goff
                     # Envoi de la candidature
                     if self.send_cv_application(recipient_email, recipient_name, company, position, cv_path, cover_letter):
                         stats["sent"] += 1
+                        self.mark_email_as_sent(recipient_email)
                         logging.info(f"Candidature envoyée à {company} ({recipient_email})")
                     else:
                         stats["failed"] += 1
@@ -380,6 +437,101 @@ Erwan Le Goff
             stats["error"] = str(e)
         
         return stats
+    
+    def scheduled_cv_send(self, recipients_file, cv_path):
+        """
+        Fonction appelée par le scheduler pour envoyer des candidatures
+        
+        Args:
+            recipients_file (str): Fichier CSV avec les destinataires
+            cv_path (str): Chemin vers le fichier PDF du CV
+        """
+        logging.info("=== Démarrage de l'envoi programmé de candidatures ===")
+        
+        if not os.path.exists(recipients_file):
+            logging.error(f"Fichier recipients introuvable : {recipients_file}")
+            return
+        
+        if not self.validate_pdf(cv_path):
+            logging.error(f"Fichier CV invalide : {cv_path}")
+            return
+        
+        # Connexion SMTP
+        if not self.connect_smtp():
+            logging.error("Impossible de se connecter au serveur SMTP")
+            return
+        
+        try:
+            # Envoi des candidatures
+            stats = self.send_bulk_cv_applications(recipients_file, cv_path)
+            
+            # Log des statistiques
+            logging.info(f"Envoi programmé terminé - Stats: {stats}")
+            
+            # Notification si tous les emails ont été envoyés
+            if stats["sent"] == 0 and stats["skipped"] > 0:
+                logging.info("Tous les emails ont déjà été envoyés récemment")
+            
+        except Exception as e:
+            logging.error(f"Erreur pendant l'envoi programmé : {e}")
+        
+        finally:
+            self.disconnect_smtp()
+    
+    def start_scheduler(self, recipients_file, cv_path, interval_hours=12):
+        """
+        Démarre le scheduler pour l'envoi automatique
+        
+        Args:
+            recipients_file (str): Fichier CSV avec les destinataires
+            cv_path (str): Chemin vers le fichier PDF du CV
+            interval_hours (int): Intervalle en heures entre les envois
+        """
+        if self.scheduler_running:
+            logging.warning("Le scheduler est déjà en cours d'exécution")
+            return
+        
+        self.scheduler_running = True
+        
+        # Configuration du scheduler
+        schedule.every(interval_hours).hours.do(
+            self.scheduled_cv_send, 
+            recipients_file, 
+            cv_path
+        )
+        
+        logging.info(f"Scheduler démarré - Envoi toutes les {interval_hours} heures")
+        logging.info(f"Prochaine exécution: {schedule.next_run()}")
+        
+        # Boucle d'exécution du scheduler
+        def run_scheduler():
+            while self.scheduler_running:
+                try:
+                    schedule.run_pending()
+                    time.sleep(60)  # Vérification toutes les minutes
+                except Exception as e:
+                    logging.error(f"Erreur dans le scheduler : {e}")
+                    time.sleep(60)
+        
+        # Démarrage du scheduler dans un thread séparé
+        scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+        scheduler_thread.start()
+        
+        return scheduler_thread
+    
+    def stop_scheduler(self):
+        """Arrête le scheduler"""
+        self.scheduler_running = False
+        schedule.clear()
+        logging.info("Scheduler arrêté")
+    
+    def get_scheduler_status(self):
+        """Retourne le statut du scheduler"""
+        return {
+            "running": self.scheduler_running,
+            "next_run": str(schedule.next_run()) if schedule.jobs else "Aucune tâche programmée",
+            "jobs_count": len(schedule.jobs)
+        }
     
     def validate_pdf(self, pdf_path):
         """
@@ -412,106 +564,207 @@ def main():
     """Fonction principale avec menu interactif"""
     email_bot = EmailAutomation()
     
-    print("=== Script d'Automatisation d'Emails ===")
-    print("1. Envoyer un email unique")
-    print("2. Envoyer des emails en masse")
-    print("3. Envoyer une candidature avec CV (unique)")
-    print("4. Envoyer des candidatures avec CV (en masse)")
-    print("5. Créer un fichier CSV d'exemple")
-    print("6. Tester la connexion SMTP")
-    print("0. Quitter")
-    
-    choice = input("Choisissez une option : ")
-    
-    if choice == "1":
-        # Email unique
-        recipient = input("Email du destinataire : ")
-        subject = input("Sujet : ")
-        body = input("Message : ")
+    while True:
+        print("\n=== Script d'Automatisation d'Emails ===")
+        print("1. Envoyer un email unique")
+        print("2. Envoyer des emails en masse")
+        print("3. Envoyer une candidature avec CV (unique)")
+        print("4. Envoyer des candidatures avec CV (en masse)")
+        print("5. Créer un fichier CSV d'exemple")
+        print("6. Tester la connexion SMTP")
+        print("7. 🕒 Démarrer l'envoi programmé (toutes les 12h)")
+        print("8. 🛑 Arrêter l'envoi programmé")
+        print("9. 📊 Statut du scheduler")
+        print("10. 📋 Voir les emails envoyés")
+        print("0. Quitter")
         
-        # Option pièce jointe
-        attachment = input("Chemin vers une pièce jointe (optionnel) : ")
-        attachments = [attachment] if attachment and os.path.exists(attachment) else None
+        choice = input("Choisissez une option : ")
         
-        if email_bot.connect_smtp():
-            email_bot.send_single_email(recipient, subject, body, attachments=attachments)
-            email_bot.disconnect_smtp()
-    
-    elif choice == "2":
-        # Emails en masse
-        csv_file = input("Fichier CSV des destinataires (recipients.csv) : ") or "recipients.csv"
-        subject_template = input("Template du sujet (ex: Bonjour {nom}) : ")
-        body_template = input("Template du message (ex: Bonjour {nom} de {entreprise}) : ")
+        if choice == "1":
+            # Email unique
+            recipient = input("Email du destinataire : ")
+            subject = input("Sujet : ")
+            body = input("Message : ")
+            
+            # Option pièce jointe
+            attachment = input("Chemin vers une pièce jointe (optionnel) : ")
+            attachments = [attachment] if attachment and os.path.exists(attachment) else None
+            
+            if email_bot.connect_smtp():
+                email_bot.send_single_email(recipient, subject, body, attachments=attachments)
+                email_bot.disconnect_smtp()
         
-        if email_bot.connect_smtp():
-            stats = email_bot.send_bulk_emails(csv_file, subject_template, body_template)
-            print(f"Statistiques : {stats['sent']} envoyés, {stats['failed']} échoués sur {stats['total']} total")
-            email_bot.disconnect_smtp()
-    
-    elif choice == "3":
-        # Candidature unique avec CV
-        print("\n=== Envoi de candidature avec CV ===")
-        cv_path = input("Chemin vers votre CV (PDF) : ")
+        elif choice == "2":
+            # Emails en masse
+            csv_file = input("Fichier CSV des destinataires (recipients.csv) : ") or "recipients.csv"
+            subject_template = input("Template du sujet (ex: Bonjour {nom}) : ")
+            body_template = input("Template du message (ex: Bonjour {nom} de {entreprise}) : ")
+            
+            if email_bot.connect_smtp():
+                stats = email_bot.send_bulk_emails(csv_file, subject_template, body_template)
+                print(f"Statistiques : {stats['sent']} envoyés, {stats['failed']} échoués sur {stats['total']} total")
+                email_bot.disconnect_smtp()
         
-        if not email_bot.validate_pdf(cv_path):
-            print("❌ Fichier CV invalide ou introuvable. Assurez-vous que c'est un fichier PDF.")
-            return
+        elif choice == "3":
+            # Candidature unique avec CV
+            print("\n=== Envoi de candidature avec CV ===")
+            cv_path = input("Chemin vers votre CV (PDF) : ")
+            
+            if not email_bot.validate_pdf(cv_path):
+                print("❌ Fichier CV invalide ou introuvable. Assurez-vous que c'est un fichier PDF.")
+                continue
+            
+            recipient_email = input("Email du recruteur : ")
+            recipient_name = input("Nom du recruteur : ")
+            company = input("Nom de l'entreprise : ")
+            position = input("Poste visé : ")
+            
+            # Lettre de motivation personnalisée (optionnel)
+            custom_letter = input("Lettre de motivation personnalisée (Entrée pour utiliser le template par défaut) : ")
+            
+            if email_bot.connect_smtp():
+                success = email_bot.send_cv_application(
+                    recipient_email, recipient_name, company, position, cv_path, 
+                    custom_letter if custom_letter else None
+                )
+                if success:
+                    print("✅ Candidature envoyée avec succès !")
+                    email_bot.mark_email_as_sent(recipient_email)
+                else:
+                    print("❌ Échec de l'envoi de la candidature.")
+                email_bot.disconnect_smtp()
         
-        recipient_email = input("Email du recruteur : ")
-        recipient_name = input("Nom du recruteur : ")
-        company = input("Nom de l'entreprise : ")
-        position = input("Poste visé : ")
-        
-        # Lettre de motivation personnalisée (optionnel)
-        custom_letter = input("Lettre de motivation personnalisée (Entrée pour utiliser le template par défaut) : ")
-        
-        if email_bot.connect_smtp():
-            success = email_bot.send_cv_application(
-                recipient_email, recipient_name, company, position, cv_path, 
-                custom_letter if custom_letter else None
-            )
-            if success:
-                print("✅ Candidature envoyée avec succès !")
+        elif choice == "4":
+            # Candidatures en masse avec CV
+            print("\n=== Envoi de candidatures en masse avec CV ===")
+            cv_path = input("Chemin vers votre CV (PDF) : ")
+
+            if not email_bot.validate_pdf(cv_path):
+                print("❌ Fichier CV invalide ou introuvable. Assurez-vous que c'est un fichier PDF.")
+                continue
+
+            csv_file = input("Fichier CSV des destinataires (recipients.csv) : ") or "recipients.csv"
+
+            if not os.path.exists(csv_file):
+                print(f"❌ Fichier {csv_file} introuvable.")
+                continue
+
+            if email_bot.connect_smtp():
+                stats = email_bot.send_bulk_cv_applications(csv_file, cv_path)
+                print(f"Statistiques : {stats['sent']} envoyés, {stats['failed']} échoués, {stats['skipped']} ignorés sur {stats['total']} total")
+                email_bot.disconnect_smtp()
+
+        elif choice == "5":
+            email_bot.create_sample_csv()
+            print("✅ Fichier CSV d'exemple créé !")
+
+        elif choice == "6":
+            if email_bot.connect_smtp():
+                print("✅ Connexion SMTP réussie !")
+                email_bot.disconnect_smtp()
             else:
-                print("❌ Échec de l'envoi de la candidature.")
-            email_bot.disconnect_smtp()
-    
-    elif choice == "4":
-        # Candidatures en masse avec CV
-        print("\n=== Envoi de candidatures en masse avec CV ===")
-        cv_path = input("Chemin vers votre CV (PDF) : ")
+                print("❌ Échec de la connexion SMTP.")
 
-        if not email_bot.validate_pdf(cv_path):
-            print("❌ Fichier CV invalide ou introuvable. Assurez-vous que c'est un fichier PDF.")
-            return
+        elif choice == "7":
+            # Démarrer l'envoi programmé
+            print("\n=== Configuration de l'envoi programmé ===")
+            
+            cv_path = input("Chemin vers votre CV (PDF) : ")
+            if not email_bot.validate_pdf(cv_path):
+                print("❌ Fichier CV invalide ou introuvable.")
+                continue
+            
+            csv_file = input("Fichier CSV des destinataires (recipients.csv) : ") or "recipients.csv"
+            if not os.path.exists(csv_file):
+                print(f"❌ Fichier {csv_file} introuvable.")
+                continue
+            
+            # Configuration de l'intervalle
+            interval_input = input("Intervalle entre les envois en heures (12 par défaut) : ")
+            try:
+                interval_hours = int(interval_input) if interval_input else 12
+            except ValueError:
+                interval_hours = 12
+            
+            # Confirmation
+            print(f"\n📋 Configuration:")
+            print(f"   CV: {cv_path}")
+            print(f"   Destinataires: {csv_file}")
+            print(f"   Intervalle: {interval_hours} heures")
+            
+            confirm = input("\nDémarrer l'envoi programmé ? (o/N) : ").lower()
+            if confirm in ['o', 'oui', 'y', 'yes']:
+                email_bot.start_scheduler(csv_file, cv_path, interval_hours)
+                print("✅ Envoi programmé démarré !")
+                print("Le script continuera à fonctionner en arrière-plan.")
+                print("Appuyez sur Entrée pour revenir au menu...")
+                input()
+            else:
+                print("❌ Envoi programmé annulé.")
 
-        csv_file = input("Fichier CSV des destinataires (recipients.csv) : ") or "recipients.csv"
+        elif choice == "8":
+            # Arrêter l'envoi programmé
+            status = email_bot.get_scheduler_status()
+            if status["running"]:
+                email_bot.stop_scheduler()
+                print("✅ Envoi programmé arrêté.")
+            else:
+                print("ℹ️  Aucun envoi programmé en cours.")
 
-        if not os.path.exists(csv_file):
-            print(f"❌ Fichier {csv_file} introuvable.")
-            return
+        elif choice == "9":
+            # Statut du scheduler
+            status = email_bot.get_scheduler_status()
+            print(f"\n📊 Statut du scheduler:")
+            print(f"   État: {'🟢 Actif' if status['running'] else '🔴 Arrêté'}")
+            print(f"   Prochaine exécution: {status['next_run']}")
+            print(f"   Tâches programmées: {status['jobs_count']}")
+            
+            if status["running"]:
+                print(f"   Emails envoyés: {len(email_bot.sent_emails)}")
+                print("\nAppuyez sur Entrée pour continuer...")
+                input()
 
-        if email_bot.connect_smtp():
-            stats = email_bot.send_bulk_cv_applications(csv_file, cv_path)
-            print(f"Statistiques : {stats['sent']} envoyés, {stats['failed']} échoués sur {stats['total']} total")
-            email_bot.disconnect_smtp()
+        elif choice == "10":
+            # Voir les emails envoyés
+            print(f"\n📋 Emails envoyés ({len(email_bot.sent_emails)} total):")
+            if email_bot.sent_emails:
+                for email, timestamp in list(email_bot.sent_emails.items())[-10:]:  # Derniers 10
+                    try:
+                        sent_time = datetime.fromisoformat(timestamp)
+                        formatted_time = sent_time.strftime("%d/%m/%Y %H:%M")
+                        print(f"   📧 {email} - {formatted_time}")
+                    except:
+                        print(f"   📧 {email} - {timestamp}")
+                
+                if len(email_bot.sent_emails) > 10:
+                    print(f"   ... et {len(email_bot.sent_emails) - 10} autres")
+            else:
+                print("   Aucun email envoyé pour le moment.")
+            
+            print("\nAppuyez sur Entrée pour continuer...")
+            input()
 
-    elif choice == "5":
-        email_bot.create_sample_csv()
+        elif choice == "0":
+            # Quitter
+            if email_bot.scheduler_running:
+                print("⚠️  Un envoi programmé est en cours.")
+                stop_scheduler = input("Voulez-vous l'arrêter avant de quitter ? (o/N) : ").lower()
+                if stop_scheduler in ['o', 'oui', 'y', 'yes']:
+                    email_bot.stop_scheduler()
+                    print("✅ Scheduler arrêté.")
+                else:
+                    print("⚠️  Le scheduler continuera à fonctionner en arrière-plan.")
+            
+            print("Fermeture du programme. Au revoir !")
+            break
 
-    elif choice == "6":
-        if email_bot.connect_smtp():
-            print("✅ Connexion SMTP réussie !")
-            email_bot.disconnect_smtp()
         else:
-            print("❌ Échec de la connexion SMTP.")
-
-    elif choice == "0":
-        print("Fermeture du programme. Au revoir !")
-
-    else:
-        print("Option invalide. Veuillez réessayer.")
+            print("❌ Option invalide. Veuillez réessayer.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n🛑 Interruption par l'utilisateur.")
+        print("Fermeture du programme...")
